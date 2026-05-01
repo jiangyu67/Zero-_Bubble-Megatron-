@@ -466,12 +466,15 @@ def backward_step_full(
     *,
     split_backward: bool = False,
     backward_type: Optional[str] = None,
+    model_for_weight_backward: Optional[torch.nn.Module] = None,
 ):
     """Internal backward with optional zero-bubble split (Bi vs Bw).
 
     Bi (backward_type == 'input'): gradients w.r.t. stage inputs only (via autograd.grad),
     retaining the graph for a subsequent Bw pass.
-    Bw (backward_type == 'weight'): full backward from output_tensor to parameters (and inputs).
+    Bw (backward_type == 'weight'): backward restricted to this stage's `nn.Parameter`
+    tensors (via `torch.autograd.backward(..., inputs=...)`) so we do not recompute input
+    (activation) grads already covered by Bi.
     """
 
     if config.timers is not None:
@@ -555,7 +558,23 @@ def backward_step_full(
         if config.deallocate_pipeline_outputs:
             custom_backward(output_tensor[0], grad_out)
         else:
-            torch.autograd.backward(output_tensor[0], grad_tensors=grad_out)
+            # IMPORTANT (zero-bubble performance):
+            # A full `torch.autograd.backward(...)` recomputes *all* leaf grads (including activations),
+            # effectively duplicating the expensive backward vs Bi-only `autograd.grad`.
+            # Restrict to this pipeline stage's parameters (Megatron `model` is already PP-sharded).
+            if model_for_weight_backward is None:
+                raise RuntimeError(
+                    "zero-bubble Bw (split_backward weight) requires model_for_weight_backward "
+                    "when deallocate_pipeline_outputs is False."
+                )
+            params = [p for p in model_for_weight_backward.parameters() if p.requires_grad]
+            if params:
+                torch.autograd.backward(
+                    tensors=output_tensor[0],
+                    grad_tensors=grad_out,
+                    retain_graph=False,
+                    inputs=params,
+                )
 
         if config.timers is not None:
             config.timers('backward-compute').stop()
@@ -607,8 +626,10 @@ def backward_input_step(input_tensor, output_tensor, output_tensor_grad, model_t
     )
 
 
-def backward_weight_step(output_tensor, output_tensor_grad, config):
-    """Zero-bubble Bw: weight gradients after Bi has retained the graph."""
+def backward_weight_step(
+    output_tensor, output_tensor_grad, config, model_for_weight_backward: torch.nn.Module
+):
+    """Zero-bubble Bw: parameter gradients after Bi retained the graph."""
     return backward_step_full(
         None,
         output_tensor,
@@ -617,6 +638,7 @@ def backward_weight_step(output_tensor, output_tensor_grad, config):
         config=config,
         split_backward=True,
         backward_type='weight',
+        model_for_weight_backward=model_for_weight_backward,
     )
 
 
@@ -2211,6 +2233,8 @@ def forward_backward_pipelining_with_zero_bubble(
     model_type = get_model_type(model[0])
     rank = p2p_communicator.pp_group.rank()
     pp_group = p2p_communicator.pp_group
+    is_first_stage = is_pp_first_stage(pp_group)
+    is_last_stage = is_pp_last_stage(pp_group)
 
     recv_tensor_shapes = get_tensor_shapes(
         seq_length=seq_length,
@@ -2238,6 +2262,7 @@ def forward_backward_pipelining_with_zero_bubble(
         )
     tensor_shape = recv_tensor_shapes[0]
 
+    # Use FIFO queues (like 1F1B) so each microbatch is backwarded exactly once.
     input_tensors: List = []
     output_tensors: List = []
     output_tensor_grads: List = []
@@ -2290,7 +2315,7 @@ def forward_backward_pipelining_with_zero_bubble(
     def backward_weight_step_helper(microbatch_id, output_tensor, output_tensor_grad):
         nvtx_range_push(f"MB_{microbatch_id}_Bw")
         try:
-            backward_weight_step(output_tensor, output_tensor_grad, config)
+            backward_weight_step(output_tensor, output_tensor_grad, config, model[0])
         finally:
             nvtx_range_pop()
         if saved_deallocate_pipeline_outputs and output_tensor is not None:
@@ -2301,6 +2326,7 @@ def forward_backward_pipelining_with_zero_bubble(
         if not wait_handles:
             return
         handles = list(wait_handles.values()) if isinstance(wait_handles, dict) else list(wait_handles)
+        # Fill bubble with pending Bw tasks.
         while pending_Bw_queue:
             microbatch_id, o_tensor, o_grad = pending_Bw_queue.popleft()
             backward_weight_step_helper(microbatch_id, o_tensor, o_grad)
@@ -2311,14 +2337,19 @@ def forward_backward_pipelining_with_zero_bubble(
             except Exception:
                 pass
 
+    def maybe_process_pending_bw(force: bool = False) -> None:
+        """Prevent unbounded graph retention by limiting pending Bw."""
+        max_pending = 1 if is_last_stage else max(2, pipeline_parallel_size)
+        if force or len(pending_Bw_queue) > max_pending:
+            while pending_Bw_queue:
+                microbatch_id, o_tensor, o_grad = pending_Bw_queue.popleft()
+                backward_weight_step_helper(microbatch_id, o_tensor, o_grad)
+
     def forward_step_helper(microbatch_id, checkpoint_activations_microbatch=None):
         nonlocal total_num_tokens
         nvtx_range_push(f"MB_{microbatch_id}_F")
         try:
-            if microbatch_id < len(input_tensors):
-                in_tensor = input_tensors[microbatch_id]
-            else:
-                in_tensor = None
+            in_tensor = input_tensors[-1] if input_tensors else None
             output_tensor, num_tokens = forward_step(
                 forward_step_func,
                 data_iterator,
@@ -2339,19 +2370,17 @@ def forward_backward_pipelining_with_zero_bubble(
             )
         finally:
             nvtx_range_pop()
-        if len(output_tensors) <= microbatch_id:
-            output_tensors.append(output_tensor)
-        else:
-            output_tensors[microbatch_id] = output_tensor
+        output_tensors.append(output_tensor)
         total_num_tokens += num_tokens
         return output_tensor
 
     def backward_input_step_helper(microbatch_id):
         nvtx_range_push(f"MB_{microbatch_id}_Bi")
         try:
-            output_tensor = output_tensors[microbatch_id]
-            output_tensor_grad = output_tensor_grads[microbatch_id]
-            input_tensor = input_tensors[microbatch_id] if microbatch_id < len(input_tensors) else None
+            # Oldest outstanding microbatch.
+            input_tensor = input_tensors.pop(0) if input_tensors else None
+            output_tensor = output_tensors.pop(0) if output_tensors else None
+            output_tensor_grad = output_tensor_grads.pop(0) if output_tensor_grads else None
             input_tensor_grad = backward_input_step(
                 input_tensor, output_tensor, output_tensor_grad, model_type, config
             )
@@ -2361,13 +2390,13 @@ def forward_backward_pipelining_with_zero_bubble(
 
     try:
         nvtx_range_push(suffix="warmup")
-        input_tensor = p2p_communicator.recv_forward(
-            recv_tensor_shapes, is_pp_first_stage(pp_group)
-        )
+        # Use single-shape API to avoid list[tensor] plumbing.
+        input_tensor = p2p_communicator.recv_forward(tensor_shape, is_first_stage)
         input_tensors.append(input_tensor)
 
         for k in range(num_warmup_microbatches):
-            recv_prev = k < (num_warmup_microbatches - 1)
+            # Only non-first stage can receive from previous stage.
+            recv_prev = (not is_first_stage) and (k < (num_warmup_microbatches - 1))
             if max_outstanding_backprops is not None:
                 checkpoint_activations_microbatch = (
                     k % max_outstanding_backprops
@@ -2376,7 +2405,7 @@ def forward_backward_pipelining_with_zero_bubble(
             else:
                 checkpoint_activations_microbatch = None
 
-            in_tensor = input_tensors[k]
+            in_tensor = input_tensors[-1]
             output_tensor, num_tokens = forward_step(
                 forward_step_func,
                 data_iterator,
@@ -2394,22 +2423,20 @@ def forward_backward_pipelining_with_zero_bubble(
                 is_last_stage=is_pp_last_stage(pp_group),
             )
             total_num_tokens += num_tokens
-            if len(output_tensors) <= k:
-                output_tensors.append(output_tensor)
-            else:
-                output_tensors[k] = output_tensor
+            output_tensors.append(output_tensor)
 
             if not is_pp_last_stage(pp_group):
+                comm_out = output_tensor[0] if isinstance(output_tensor, list) else output_tensor
                 input_tensor = p2p_communicator.send_forward_recv_forward(
-                    output_tensor, recv_prev=recv_prev, tensor_shape=tensor_shape
+                    comm_out, recv_prev=recv_prev, tensor_shape=tensor_shape
                 )
                 if recv_prev and k + 1 >= len(input_tensors):
                     input_tensors.append(input_tensor)
                 elif recv_prev:
-                    input_tensors[k + 1] = input_tensor
+                    input_tensors.append(input_tensor)
             else:
                 if recv_prev:
-                    input_tensor = p2p_communicator.recv_forward(recv_tensor_shapes, False)
+                    input_tensor = p2p_communicator.recv_forward(tensor_shape, False)
                     input_tensors.append(input_tensor)
         nvtx_range_pop(suffix="warmup")
 
@@ -2417,15 +2444,11 @@ def forward_backward_pipelining_with_zero_bubble(
         for k in range(num_microbatches_remaining):
             forward_k = k + num_warmup_microbatches
             backward_k = k
-            recv_prev = forward_k < (total_num_microbatches - 1)
+            # Only non-first stage can receive from previous stage.
+            recv_prev = (not is_first_stage) and (forward_k < (total_num_microbatches - 1))
 
-            input_tensor = p2p_communicator.recv_forward(
-                recv_tensor_shapes, is_pp_first_stage(pp_group)
-            )
-            if forward_k >= len(input_tensors):
-                input_tensors.append(input_tensor)
-            else:
-                input_tensors[forward_k] = input_tensor
+            input_tensor = p2p_communicator.recv_forward(tensor_shape, is_first_stage)
+            input_tensors.append(input_tensor)
 
             if max_outstanding_backprops is not None:
                 checkpoint_activations_microbatch = (
@@ -2438,32 +2461,33 @@ def forward_backward_pipelining_with_zero_bubble(
             output_tensor = forward_step_helper(forward_k, checkpoint_activations_microbatch)
 
             if not is_pp_last_stage(pp_group):
-                input_tensor, wait_handles = p2p_communicator.send_forward_recv_forward(
-                    output_tensor,
-                    recv_prev=recv_prev,
-                    tensor_shape=tensor_shape,
-                    overlap_p2p_comm=True,
-                )
-                bubble_fill_wait(wait_handles)
+                comm_out = output_tensor[0] if isinstance(output_tensor, list) else output_tensor
+                # Async overlap requires the non-batched, non-ring-exchange p2p path.
+                # batched_p2p_comm asserts wait_on_reqs=True internally.
+                if config.batch_p2p_comm or config.use_ring_exchange_p2p:
+                    input_tensor = p2p_communicator.send_forward_recv_forward(
+                        comm_out, recv_prev=recv_prev, tensor_shape=tensor_shape
+                    )
+                else:
+                    input_tensor, wait_handles = p2p_communicator.send_forward_recv_forward(
+                        comm_out,
+                        recv_prev=recv_prev,
+                        tensor_shape=tensor_shape,
+                        overlap_p2p_comm=True,
+                    )
+                    bubble_fill_wait(wait_handles)
                 if recv_prev:
-                    if forward_k + 1 >= len(input_tensors):
-                        input_tensors.append(input_tensor)
-                    else:
-                        input_tensors[forward_k + 1] = input_tensor
+                    input_tensors.append(input_tensor)
 
             drain_mx_nonblocking()
 
             if not is_pp_last_stage(pp_group):
                 output_tensor_grad = p2p_communicator.recv_backward(
-                    send_tensor_shapes, is_pp_last_stage(pp_group)
+                    tensor_shape, is_pp_last_stage(pp_group)
                 )
-                if backward_k >= len(output_tensor_grads):
-                    output_tensor_grads.append(output_tensor_grad)
-                else:
-                    output_tensor_grads[backward_k] = output_tensor_grad
+                output_tensor_grads.append(output_tensor_grad)
             else:
-                if backward_k >= len(output_tensor_grads):
-                    output_tensor_grads.append(None)
+                output_tensor_grads.append(None)
 
             input_tensor_grad, out_t, out_g = backward_input_step_helper(backward_k)
 
@@ -2473,7 +2497,9 @@ def forward_backward_pipelining_with_zero_bubble(
                 )
 
             drain_mx_nonblocking()
+            # Defer Bw to bubble windows: Bi retained the graph; Bw fills compute bubbles.
             pending_Bw_queue.append((backward_k, out_t, out_g))
+            maybe_process_pending_bw()
 
             if num_warmup_microbatches == 0 and k == (num_microbatches_remaining - 1):
                 if config.grad_sync_func is None or rank == 0:
@@ -2481,9 +2507,7 @@ def forward_backward_pipelining_with_zero_bubble(
 
         nvtx_range_pop(suffix="steady")
 
-        while pending_Bw_queue:
-            microbatch_id, o_tensor, o_grad = pending_Bw_queue.popleft()
-            backward_weight_step_helper(microbatch_id, o_tensor, o_grad)
+        maybe_process_pending_bw(force=True)
 
         nvtx_range_push(suffix="cooldown")
         for i in range(num_warmup_microbatches):
@@ -2495,7 +2519,7 @@ def forward_backward_pipelining_with_zero_bubble(
             out_tensor = output_tensors.pop(0)
 
             out_grad = p2p_communicator.recv_backward(
-                send_tensor_shapes, is_pp_last_stage(pp_group)
+                tensor_shape, is_pp_last_stage(pp_group)
             )
 
             in_tensor_grad = backward_step(in_tensor, out_tensor, out_grad, model_type, config)

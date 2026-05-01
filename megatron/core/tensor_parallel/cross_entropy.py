@@ -194,6 +194,11 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
 
         # Retreive tensors from the forward path.
         softmax, target_mask, masked_target_1d = ctx.saved_tensors
+        # IMPORTANT: we may traverse backward more than once in some pipeline schedules
+        # (e.g. zero-bubble Bi/Bw splitting). The backward below mutates `softmax` in-place
+        # (grad_2d[...] -= ...; grad_input.mul_(...)), so we must clone to avoid modifying
+        # the saved tensor and breaking subsequent backward traversals.
+        softmax = softmax.clone()
         label_smoothing, vocab_size = ctx.label_smoothing, ctx.vocab_size
 
         (grad_2d, arange_1d, softmax_update, grad_input) = (
