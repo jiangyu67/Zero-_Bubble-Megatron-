@@ -40,8 +40,13 @@ class MegatronCheckpointLoaderBase:
         Populates self.margs and self.checkpoint_args.
         """
         # Ensure we can import Megatron
-        sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir))
+        if repo_root in sys.path:
+            sys.path.remove(repo_root)
+        sys.path.insert(0, repo_root)
         if self.args.megatron_path is not None:
+            if self.args.megatron_path in sys.path:
+                sys.path.remove(self.args.megatron_path)
             sys.path.insert(0, self.args.megatron_path)
 
         try:
@@ -470,7 +475,7 @@ class MegatronCheckpointLoaderBase:
             '--no-masked-softmax-fusion',
             '--no-bias-gelu-fusion',
             '--no-bias-dropout-fusion',
-            '--no-async-tensor-model-parallel-allreduce',
+            '--no-gradient-accumulation-fusion',
             '--use-cpu-initialization',
             '--micro-batch-size', '1',
             '--no-load-optim',

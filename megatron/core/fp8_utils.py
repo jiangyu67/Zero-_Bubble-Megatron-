@@ -614,6 +614,10 @@ if HAVE_TE:
         if not need_fp8_context or is_first_last_bf16_layer(config, layer_no):
             # bf16 training or bf16 layer in fp8 training
             fp8_context = nullcontext()
+        elif config.fp8_recipe == Fp8Recipe.mxfp8:
+            # MXFP8 simulation is handled inside TE wrappers via microscaling,
+            # so the outer training context must stay out of real TE FP8 autocast.
+            fp8_context = nullcontext()
         else:
             # fp8 training and this layer_no is in fp8
             fp8_recipe = get_fp8_recipe(config)

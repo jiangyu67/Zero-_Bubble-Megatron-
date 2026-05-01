@@ -810,6 +810,16 @@ def validate_args(args, defaults={}):
         f"Number of virtual stages per pipeline stage: {args.virtual_pipeline_model_parallel_size}"
     )
 
+    if getattr(args, 'pipeline_schedule', None) == 'zero_bubble':
+        assert args.pipeline_model_parallel_size > 1, (
+            '--pipeline-schedule zero_bubble requires pipeline-model-parallel-size > 1'
+        )
+        assert args.virtual_pipeline_model_parallel_size is None, (
+            '--pipeline-schedule zero_bubble is only supported without virtual pipeline '
+            '(do not set --num-layers-per-virtual-pipeline-stage / '
+            '--num-virtual-stages-per-pipeline-rank when using zero_bubble).'
+        )
+
     if args.overlap_param_gather:
         assert args.use_distributed_optimizer or args.use_megatron_fsdp \
             or args.optimizer == 'dist_muon', \
@@ -2541,6 +2551,11 @@ def _add_distributed_args(parser):
                        type=int, default=None,
                        help=('The number of transformer layers on the last pipeline stage of the decoder. '
                        'Default None is even split of transformer layers across all pipeline stages'))
+    group.add_argument('--pipeline-schedule',
+                       type=str, default='interleaving',
+                       choices=['interleaving', 'no_interleaving', 'zero_bubble'],
+                       help=('Pipeline schedule type. '
+                       'Options: interleaving (default), no_interleaving, zero_bubble'))
     group.add_argument('--pipeline-model-parallel-layout',
                        type=str, default=None,
                        help=('A string that describes a custom pipeline model parallel layout. '

@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import collections
 import dataclasses
 import enum
 import inspect
@@ -15,7 +16,12 @@ import torch.nn.functional as F
 from packaging.version import Version as PkgVersion
 from torch import Tensor
 from torch.nn.parameter import Parameter
-from typing_extensions import override
+try:
+    # `override` is only used for type-checking/clarity; keep runtime optional.
+    from typing_extensions import override
+except Exception:  # pragma: no cover
+    def override(func):  # type: ignore[no-redef]
+        return func
 
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
@@ -52,6 +58,7 @@ from megatron.core.transformer.utils import (
     make_sharded_tensors_for_checkpoint,
 )
 from megatron.core.typed_torch import copy_signature
+from megatron.core.pipeline_parallel.async_comm import get_async_comm_queue
 from megatron.core.utils import (
     get_pg_rank,
     get_pg_size,
@@ -80,6 +87,69 @@ except ImportError:
         HAVE_TE = False
 
 _TE_CONFIG_TYPE_KEY = "transformer_engine_config_type"
+
+_MX_SCALE_COMM_QUEUE = collections.deque()
+_DLRC_TASK_QUEUE = collections.deque()
+
+
+def enqueue_mx_scale_handle(handle):
+    """Enqueue an asynchronous MX scale communication handle."""
+    if handle is None:
+        return
+    try:
+        from megatron.core.pipeline_parallel.async_comm import get_async_comm_queue
+
+        get_async_comm_queue().push(handle)
+    except Exception:
+        _MX_SCALE_COMM_QUEUE.append(handle)
+
+
+def pop_mx_scale_handle():
+    """Pop the oldest pending MX scale communication handle."""
+    return _MX_SCALE_COMM_QUEUE.popleft() if _MX_SCALE_COMM_QUEUE else None
+
+
+def enqueue_dlrc_task(task):
+    """Enqueue a DLRC bubble-fill task."""
+    if task is not None:
+        _DLRC_TASK_QUEUE.append(task)
+
+
+def pop_dlrc_task():
+    """Pop the oldest pending DLRC task."""
+    return _DLRC_TASK_QUEUE.popleft() if _DLRC_TASK_QUEUE else None
+
+
+def _simulate_mxfp8_quantize(
+    tensor: torch.Tensor,
+    block_size: int = 32,
+    fmt: str = "e4m3",
+) -> torch.Tensor:
+    """Simulate MXFP8 blockwise quantization and dequantization."""
+    try:
+        import microscaling
+
+        quantized = microscaling.quantize_mx(tensor, block_size=block_size, fmt=fmt)
+        if hasattr(quantized, "dequantize"):
+            return quantized.dequantize().to(tensor.dtype)
+        if hasattr(microscaling, "dequantize_mx"):
+            return microscaling.dequantize_mx(quantized).to(tensor.dtype)
+        return tensor
+    except Exception:
+        if not tensor.is_floating_point():
+            tensor = tensor.to(torch.float32)
+        dtype = tensor.dtype
+        flat = tensor.reshape(-1)
+        numel = flat.numel()
+        padded_len = ((numel + block_size - 1) // block_size) * block_size
+        if padded_len != numel:
+            flat = F.pad(flat, (0, padded_len - numel))
+        blocks = flat.view(-1, block_size)
+        amax = blocks.abs().amax(dim=1, keepdim=True).clamp_min(1e-8)
+        scale = amax / 127.0
+        q = torch.clamp((blocks / scale).round(), -127, 127)
+        deq = (q * scale).view(-1)[:numel].view(tensor.shape)
+        return deq.to(dtype)
 
 
 class TransformerEngineConfigType(enum.Enum):
@@ -294,6 +364,53 @@ def _get_should_context_be_quantized_params(
         return _get_should_context_be_quantized_recipe(
             qparams.training_recipe, is_context_quantized
         )
+
+
+def _get_effective_quant_recipe(
+    qparams: TEQuantizationParams | None, training: bool
+) -> TEQuantizationRecipe | None:
+    """Return the active recipe for the current module mode."""
+    if qparams is None:
+        return None
+    if not training and qparams.evaluation_recipe is not None:
+        return qparams.evaluation_recipe
+    return qparams.training_recipe
+
+
+def _is_mxfp8_sim_recipe(
+    config: TransformerConfig,
+    qparams: TEQuantizationParams | None,
+    training: bool,
+) -> bool:
+    """Whether the module should run under microscaling MXFP8 simulation."""
+    recipe = _get_effective_quant_recipe(qparams, training)
+    if recipe is None:
+        fp8_recipe = getattr(config, "fp8_recipe", None)
+        return fp8_recipe == Fp8Recipe.mxfp8 or fp8_recipe == "mxfp8"
+    return recipe.fp8_quantization_recipe == Fp8Recipe.mxfp8
+
+
+def _get_mxfp8_sim_format(
+    config: TransformerConfig,
+    qparams: TEQuantizationParams | None,
+    training: bool,
+) -> str:
+    """Resolve the FP8 format for microscaling MXFP8 simulation."""
+    recipe = _get_effective_quant_recipe(qparams, training)
+    if recipe is not None and recipe.fp8_quantization_recipe == Fp8Recipe.mxfp8:
+        return recipe.fp8_format
+    return "hybrid" if getattr(config, "fp8", None) == "hybrid" else "e4m3"
+
+
+def _get_te_forward_context(
+    config: TransformerConfig,
+    qparams: TEQuantizationParams | None,
+    training: bool,
+):
+    """Return the TE forward context after accounting for simulation mode."""
+    if _is_mxfp8_sim_recipe(config, qparams, training):
+        return nullcontext()
+    return _get_fp8_autocast_for_quant_params(qparams, training)
 
 
 def _get_extra_te_kwargs(config: TransformerConfig):
@@ -828,6 +945,7 @@ class TELinear(te.pytorch.Linear):
             **extra_kwargs,
         )
         self.te_quant_params: Optional[TEQuantizationParams] = None
+        self.mxfp8_sim_enabled = getattr(config, "fp8_recipe", None) == "mxfp8"
 
         for param in self.parameters():
             if is_expert:
@@ -853,6 +971,66 @@ class TELinear(te.pytorch.Linear):
         else:
             self.te_quant_params = TEQuantizationParams.parse_from_config(quantization_config)
 
+    def _build_quantized_weight_for_metrics(self, original_weight: torch.Tensor):
+        """Build a representative FP8 quantized weight for metrics computation."""
+        if self.te_quant_params is None:
+            return None
+        recipe = self.te_quant_params.training_recipe
+        if recipe.fp8_quantization_recipe is None:
+            return None
+
+        try:
+            from transformer_engine.pytorch.tensor.float8_tensor import (
+                Float8CurrentScalingQuantizer,
+                Float8Quantizer,
+            )
+        except ImportError:
+            return None
+
+        if recipe.fp8_format == "e4m3":
+            fp8_dtype = te.common.recipe.Format.E4M3
+        elif recipe.fp8_format == "hybrid":
+            fp8_dtype = te.common.recipe.Format.HYBRID
+        else:
+            return None
+
+        if recipe.fp8_quantization_recipe == Fp8Recipe.delayed:
+            amax = original_weight.abs().amax()
+            if amax.item() == 0.0:
+                return None
+            scale = torch.tensor([1.0], device=original_weight.device, dtype=torch.float32) / amax
+            quantizer = Float8Quantizer(
+                scale=scale,
+                amax=amax.to(torch.float32),
+                fp8_dtype=fp8_dtype,
+            )
+        elif recipe.fp8_quantization_recipe == Fp8Recipe.tensorwise:
+            quantizer = Float8CurrentScalingQuantizer(fp8_dtype, original_weight.device)
+        else:
+            return None
+
+        return quantizer.quantize(original_weight)
+
+    def _activate_dlrc(self, rank: int = 8) -> None:
+        """Lazily attach a rank-8 DLRC low-rank branch."""
+        if getattr(self, "_dlrc_active", False):
+            return
+        self._dlrc_active = True
+        self._dlrc_rank = rank
+        self.dlrc_down = torch.nn.Parameter(
+            torch.zeros(rank, self.in_features, device=self.weight.device, dtype=self.weight.dtype)
+        )
+        self.dlrc_up = torch.nn.Parameter(
+            torch.zeros(self.out_features, rank, device=self.weight.device, dtype=self.weight.dtype)
+        )
+
+    def _apply_dlrc(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the low-rank compensation branch if it is active."""
+        if not getattr(self, "_dlrc_active", False):
+            return torch.zeros((), device=x.device, dtype=x.dtype)
+        correction = x.matmul(self.dlrc_down.t())
+        return correction.matmul(self.dlrc_up.t())
+
     def will_execute_quantized(self, is_context_quantized: bool) -> bool:
         """Returns whether the module is configured to execute quantized."""
         return _get_should_context_be_quantized_params(
@@ -864,15 +1042,92 @@ class TELinear(te.pytorch.Linear):
         _is_first_microbatch = (
             None if self.disable_parameter_transpose_cache else self.is_first_microbatch
         )
-        quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
-
-        with quant_context:
-            out = super().forward(x, is_first_microbatch=_is_first_microbatch)
+        use_mxfp8_sim = _is_mxfp8_sim_recipe(self.config, self.te_quant_params, self.training)
+        if use_mxfp8_sim:
+            fmt = _get_mxfp8_sim_format(self.config, self.te_quant_params, self.training)
+            quantized_x = _simulate_mxfp8_quantize(x, fmt=fmt)
+            original_weight = self.weight.data.clone()
+            quantized_weight = _simulate_mxfp8_quantize(original_weight, fmt=fmt)
+            self.weight.data = quantized_weight
+            try:
+                out = super().forward(quantized_x, is_first_microbatch=_is_first_microbatch)
+            finally:
+                self.weight.data = original_weight
+        else:
+            quant_context = _get_te_forward_context(self.config, self.te_quant_params, self.training)
+            original_weight = None
+            if hasattr(self, 'weight') and self.weight is not None:
+                original_weight = self.weight.data.clone()
+            with quant_context:
+                out = super().forward(x, is_first_microbatch=_is_first_microbatch)
         self.is_first_microbatch = False
 
-        # TE only returns a tuple when return_bias is True, otherwise
-        # it returns a single Tensor, we always want to return two
-        # values regardless of the arguments.
+        # ==== MXFP8 模拟量化与通信句柄注入 ====
+        self.last_mxfp8_comm_handle = None
+        self.last_mxfp8_comm_bytes = 0.0
+        self.last_mxfp8_metrics = None
+
+        if use_mxfp8_sim:
+            try:
+                import microscaling
+
+                fmt = _get_mxfp8_sim_format(self.config, self.te_quant_params, self.training)
+                quantized_input = microscaling.quantize_mx(x, block_size=32, fmt=fmt)
+                quantized_weight = microscaling.quantize_mx(self.weight.data, block_size=32, fmt=fmt)
+                num_elements = quantized_weight.numel()
+                self.last_mxfp8_comm_bytes = float(num_elements) / 32.0 * 4.0
+
+                if torch.distributed.is_initialized():
+                    comm_tensor = torch.tensor(
+                        [self.last_mxfp8_comm_bytes],
+                        device=x.device,
+                        dtype=torch.float32,
+                    )
+                    handle = torch.distributed.all_reduce(comm_tensor, async_op=True)
+                    self.last_mxfp8_comm_handle = handle
+                    get_async_comm_queue().push(handle)
+            except Exception:
+                # microscaling may be unavailable; preserve normal execution.
+                pass
+
+        # ==== 计算 SignRate 和 CosSim 指标 ====
+        if original_weight is not None and self.training:
+            quantized_weight = None
+            if hasattr(self.weight, '_data') and not isinstance(self.weight, torch.nn.Parameter):
+                quantized_weight = self.weight._data
+            else:
+                quantized_weight = self._build_quantized_weight_for_metrics(original_weight)
+
+            if quantized_weight is not None:
+                try:
+                    from megatron.core.quantization.metrics import compute_quantization_metrics
+
+                    layer_name = f"{self.__class__.__name__}_{id(self)}"
+                    sign_rate, cos_sim = compute_quantization_metrics(
+                        original_weight,
+                        quantized_weight,
+                        layer_name,
+                        async_compute=False,
+                    )
+                    needs_lrc = sign_rate < 0.95 or cos_sim < 0.98
+                    self.last_mxfp8_metrics = {
+                        "sign_rate": sign_rate,
+                        "cos_sim": cos_sim,
+                        "needs_lrc": needs_lrc,
+                        "simulated_comm_bytes": self.last_mxfp8_comm_bytes,
+                    }
+                    if needs_lrc:
+                        self._activate_dlrc(rank=8)
+                except ImportError:
+                    pass  # metrics 模块未安装
+
+        if getattr(self, "_dlrc_active", False):
+            correction = self._apply_dlrc(x)
+            if isinstance(out, tuple):
+                out = (out[0] + correction, out[1])
+            else:
+                out = out + correction
+
         if self.te_return_bias:
             return out
         return out, None
@@ -952,6 +1207,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         self.te_return_bias = skip_bias_add and bias
         self.is_first_microbatch = True
         self.disable_parameter_transpose_cache = self.config.disable_parameter_transpose_cache
+        self.mxfp8_sim_enabled = getattr(config, "fp8_recipe", None) == "mxfp8"
         extra_kwargs = _get_extra_te_kwargs(config)
         self.tp_size = get_pg_size(tp_group)
         self.tp_rank = get_pg_rank(tp_group)
@@ -1085,10 +1341,21 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         _is_first_microbatch = (
             None if self.disable_parameter_transpose_cache else self.is_first_microbatch
         )
-        quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
-
-        with quant_context:
-            out = super().forward(x, is_first_microbatch=_is_first_microbatch)
+        use_mxfp8_sim = _is_mxfp8_sim_recipe(self.config, self.te_quant_params, self.training)
+        if use_mxfp8_sim:
+            fmt = _get_mxfp8_sim_format(self.config, self.te_quant_params, self.training)
+            quantized_x = _simulate_mxfp8_quantize(x, fmt=fmt)
+            original_weight = self.weight.data.clone()
+            quantized_weight = _simulate_mxfp8_quantize(original_weight, fmt=fmt)
+            self.weight.data = quantized_weight
+            try:
+                out = super().forward(quantized_x, is_first_microbatch=_is_first_microbatch)
+            finally:
+                self.weight.data = original_weight
+        else:
+            quant_context = _get_te_forward_context(self.config, self.te_quant_params, self.training)
+            with quant_context:
+                out = super().forward(x, is_first_microbatch=_is_first_microbatch)
 
         self.is_first_microbatch = False
 
@@ -1161,6 +1428,7 @@ class TEColumnParallelLinear(TELinear):
         world_size = get_pg_size(tp_group)
         rank = get_pg_rank(tp_group)
         self.stride = stride
+        self.mxfp8_sim_enabled = getattr(config, "fp8_recipe", None) == "mxfp8"
 
         super().__init__(
             input_size=input_size,
@@ -1236,6 +1504,166 @@ class TEColumnParallelLinear(TELinear):
         """Compute weight gradients during the backward pass if delay_wgrad_compute is enabled."""
         if self.config.delay_wgrad_compute:
             super().backward_dw()
+
+
+class DLRCComputationTask:
+    """A bubble-fill task that computes a DLRC low-rank correction."""
+
+    def __init__(self, layer, input_tensor: torch.Tensor):
+        self.layer = layer
+        self.input_tensor = input_tensor.detach()
+
+    def run(self):
+        with torch.no_grad():
+            _ = self.layer.compute_lora_correction(self.input_tensor)
+
+
+class MXSimLinear(TEColumnParallelLinear):
+    """A TEColumnParallelLinear wrapper that simulates MXFP8 quantization and async scale communication."""
+
+    DLRC_SIGN_RATE_THRESHOLD = 0.95
+    DLRC_COS_SIM_THRESHOLD = 0.98
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        *,
+        config: ModelParallelConfig,
+        init_method: Callable,
+        gather_output: bool,
+        bias: bool,
+        skip_bias_add: bool,
+        is_expert: bool,
+        skip_weight_param_allocation: bool = False,
+        tp_comm_buffer_name: Optional[torch.distributed.ProcessGroup] = None,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        stride: int = 1,
+    ):
+        super().__init__(
+            input_size=input_size,
+            output_size=output_size,
+            config=config,
+            init_method=init_method,
+            gather_output=gather_output,
+            bias=bias,
+            skip_bias_add=skip_bias_add,
+            is_expert=is_expert,
+            skip_weight_param_allocation=skip_weight_param_allocation,
+            tp_comm_buffer_name=tp_comm_buffer_name,
+            tp_group=tp_group,
+            stride=stride,
+        )
+        self.metadata = {}
+        self.lora_rank = 8
+        self.lora_A: Optional[Parameter] = None
+        self.lora_B: Optional[Parameter] = None
+        self.lora_active = False
+
+    def _init_lora(self):
+        if self.lora_active:
+            return
+        self.lora_A = Parameter(torch.empty(self.in_features, self.lora_rank, device=self.weight.device))
+        self.lora_B = Parameter(torch.empty(self.lora_rank, self.out_features, device=self.weight.device))
+        torch.nn.init.xavier_uniform_(self.lora_A)
+        torch.nn.init.zeros_(self.lora_B)
+        self.lora_active = True
+
+    def compute_lora_correction(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.lora_active or self.lora_A is None or self.lora_B is None:
+            return torch.zeros_like(x @ self.weight.t())
+        return x @ self.lora_A @ self.lora_B
+
+    def _build_simulated_quantized(self, tensor: torch.Tensor):
+        fmt = "hybrid" if getattr(self.config, "fp8", None) == "hybrid" else "e4m3"
+        return _simulate_mxfp8_quantize(tensor, fmt=fmt)
+
+    def forward(self, x):
+        _is_first_microbatch = (
+            None if self.disable_parameter_transpose_cache else self.is_first_microbatch
+        )
+        use_mxfp8_sim = _is_mxfp8_sim_recipe(self.config, self.te_quant_params, self.training)
+        if use_mxfp8_sim:
+            quant_context = nullcontext()
+        else:
+            quant_context = _get_te_forward_context(self.config, self.te_quant_params, self.training)
+
+        original_weight = self.weight.data.clone() if hasattr(self, 'weight') and self.weight is not None else None
+        if use_mxfp8_sim:
+            fmt = _get_mxfp8_sim_format(self.config, self.te_quant_params, self.training)
+            quantized_x = _simulate_mxfp8_quantize(x, fmt=fmt)
+            quantized_weight = _simulate_mxfp8_quantize(original_weight, fmt=fmt)
+            self.weight.data = quantized_weight
+            try:
+                with quant_context:
+                    _super_fwd = super().forward
+                    _params = inspect.signature(_super_fwd).parameters
+                    if "is_first_microbatch" in _params:
+                        out = _super_fwd(quantized_x, is_first_microbatch=_is_first_microbatch)
+                    else:
+                        out = _super_fwd(quantized_x)
+            finally:
+                self.weight.data = original_weight
+        else:
+            with quant_context:
+                # TE/Megatron wrapper signatures vary by version; only pass supported kwargs.
+                _super_fwd = super().forward
+                _params = inspect.signature(_super_fwd).parameters
+                if "is_first_microbatch" in _params:
+                    out = _super_fwd(x, is_first_microbatch=_is_first_microbatch)
+                else:
+                    out = _super_fwd(x)
+        self.is_first_microbatch = False
+
+        if original_weight is not None and self.training:
+            with torch.no_grad():
+                _ = self._build_simulated_quantized(x)
+                quantized_weight = self._build_simulated_quantized(original_weight)
+                if quantized_weight is not None:
+                    from megatron.core.quantization.metrics import compute_quantization_metrics
+                    sign_rate, cos_sim = compute_quantization_metrics(
+                        original_weight,
+                        quantized_weight,
+                        f"{self.__class__.__name__}_{id(self)}",
+                        async_compute=True,
+                    )
+                    self.metadata['sign_rate'] = sign_rate
+                    self.metadata['cos_sim'] = cos_sim
+                    self.metadata['needs_lrc'] = (
+                        sign_rate < self.DLRC_SIGN_RATE_THRESHOLD
+                        or cos_sim < self.DLRC_COS_SIM_THRESHOLD
+                    )
+                    if self.metadata['needs_lrc']:
+                        self._init_lora()
+                        enqueue_dlrc_task(DLRCComputationTask(self, x))
+                num_elements = original_weight.numel()
+                self.metadata['simulated_comm_bytes'] = float(num_elements) / 32.0 * 4.0
+
+        if torch.distributed.is_initialized():
+            comm_tensor = torch.tensor([0.0], device=x.device, dtype=torch.float32)
+            try:
+                handle = torch.distributed.all_reduce(
+                    comm_tensor,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=self._tp_group if self._tp_group is not None else torch.distributed.group.WORLD,
+                    async_op=True,
+                )
+                enqueue_mx_scale_handle(handle)
+                self.metadata['mx_scale_handle'] = True
+            except Exception:
+                pass
+
+        if self.lora_active:
+            with torch.no_grad():
+                lora_out = self.compute_lora_correction(x)
+                if isinstance(out, tuple):
+                    out = (out[0] + lora_out, out[1])
+                else:
+                    out = out + lora_out
+
+        if self.te_return_bias:
+            return out
+        return out, None
 
 
 class TERowParallelLinear(TELinear):
@@ -1551,6 +1979,12 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         num_splits: Optional[int] = None,
     ) -> torch.Tensor:
         """Forward."""
+        if _is_mxfp8_sim_recipe(self.config, None, self.training):
+            fmt = _get_mxfp8_sim_format(self.config, None, self.training)
+            query = _simulate_mxfp8_quantize(query, fmt=fmt)
+            key = _simulate_mxfp8_quantize(key, fmt=fmt)
+            value = _simulate_mxfp8_quantize(value, fmt=fmt)
+
         if packed_seq_params is not None:
             # If Dynamic CP group is provided, update TE DPA CP group
             if packed_seq_params.cp_group is not None:
@@ -1756,6 +2190,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 **extra_kwargs,
             )
             self.te_quant_params: Optional[TEQuantizationParams] = None
+            self.mxfp8_sim_enabled = getattr(config, "fp8_recipe", None) == "mxfp8"
             for param in self.parameters():
                 setattr(param, "allreduce", not (is_expert and self.expert_parallel))
 
@@ -1867,10 +2302,24 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             _is_first_microbatch = (
                 None if self.disable_parameter_transpose_cache else self.is_first_microbatch
             )
-            quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
+            use_mxfp8_sim = _is_mxfp8_sim_recipe(self.config, self.te_quant_params, self.training)
+            if use_mxfp8_sim:
+                quant_context = nullcontext()
+                fmt = _get_mxfp8_sim_format(self.config, self.te_quant_params, self.training)
+                quantized_x = _simulate_mxfp8_quantize(x, fmt=fmt)
+                original_weight = self.weight.data.clone()
+                quantized_weight = _simulate_mxfp8_quantize(original_weight, fmt=fmt)
+                self.weight.data = quantized_weight
+                try:
+                    with quant_context:
+                        out = super().forward(quantized_x, m_splits, is_first_microbatch=_is_first_microbatch)
+                finally:
+                    self.weight.data = original_weight
+            else:
+                quant_context = _get_te_forward_context(self.config, self.te_quant_params, self.training)
 
-            with quant_context:
-                out = super().forward(x, m_splits, is_first_microbatch=_is_first_microbatch)
+                with quant_context:
+                    out = super().forward(x, m_splits, is_first_microbatch=_is_first_microbatch)
             self.is_first_microbatch = False
 
             # TE only returns a tuple when return_bias is True, otherwise
@@ -2382,8 +2831,31 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             if self._fused_impl is None:
                 self._fused_impl = (self._make_fused_impl(),)
 
+            use_mxfp8_sim = _is_mxfp8_sim_recipe(
+                self.linear_fc1.config, self.linear_fc1.te_quant_params, self.training
+            ) or _is_mxfp8_sim_recipe(
+                self.linear_fc2.config, self.linear_fc2.te_quant_params, self.training
+            )
+            original_fc1_weight = None
+            original_fc2_weight = None
+            if use_mxfp8_sim:
+                fmt = _get_mxfp8_sim_format(
+                    self.linear_fc1.config, self.linear_fc1.te_quant_params, self.training
+                )
+                hidden_states = _simulate_mxfp8_quantize(hidden_states, fmt=fmt)
+                original_fc1_weight = self.linear_fc1.weight.data.clone()
+                original_fc2_weight = self.linear_fc2.weight.data.clone()
+                self.linear_fc1.weight.data = _simulate_mxfp8_quantize(original_fc1_weight, fmt=fmt)
+                self.linear_fc2.weight.data = _simulate_mxfp8_quantize(original_fc2_weight, fmt=fmt)
+
             # Apply fused impl
-            out = self._fused_impl[0](hidden_states)
+            try:
+                out = self._fused_impl[0](hidden_states)
+            finally:
+                if original_fc1_weight is not None:
+                    self.linear_fc1.weight.data = original_fc1_weight
+                if original_fc2_weight is not None:
+                    self.linear_fc2.weight.data = original_fc2_weight
 
             # Return bias tensor if requested
             bias = None

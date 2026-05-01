@@ -389,7 +389,23 @@ def load_checkpoint_to_model(args):
     from transformers import AutoModelForCausalLM
 
     # Load Huggingface model.
-    hf_model = AutoModelForCausalLM.from_pretrained(args.load, torch_dtype=args.params_dtype, low_cpu_mem_usage=True, device_map="cpu")
+    hf_load_kwargs = {
+        "torch_dtype": args.params_dtype,
+        "low_cpu_mem_usage": True,
+        "device_map": "cpu",
+    }
+    try:
+        hf_model = AutoModelForCausalLM.from_pretrained(args.load, **hf_load_kwargs)
+    except ImportError as exc:
+        if "accelerate" not in str(exc).lower():
+            raise
+        print(
+            "accelerate is not installed; retrying HF checkpoint load without "
+            "low_cpu_mem_usage/device_map."
+        )
+        hf_load_kwargs.pop("low_cpu_mem_usage")
+        hf_load_kwargs.pop("device_map")
+        hf_model = AutoModelForCausalLM.from_pretrained(args.load, **hf_load_kwargs)
 
     # Init Megatron model.
     model = model_provider(gpt_builder, pre_process=True, post_process=True).to(args.params_dtype)
@@ -407,12 +423,16 @@ def _load_checkpoint(queue, args):
 
     verify_transformers_version()
 
-    # Search in directory above this.
-    sys.path.append(os.path.abspath(
-        os.path.join(os.path.dirname(__file__),
-                     os.path.pardir,
-                     os.path.pardir)))
+    # Prefer the current checkout over any unrelated installed Megatron package.
+    repo_root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir)
+    )
+    if repo_root in sys.path:
+        sys.path.remove(repo_root)
+    sys.path.insert(0, repo_root)
     if args.megatron_path is not None:
+        if args.megatron_path in sys.path:
+            sys.path.remove(args.megatron_path)
         sys.path.insert(0, args.megatron_path)
 
     # Convert Meta checkpoint to HF format as an intermediate step
@@ -438,7 +458,7 @@ def _load_checkpoint(queue, args):
                 '--no-masked-softmax-fusion',
                 '--no-bias-gelu-fusion',
                 '--no-bias-dropout-fusion',
-                '--no-async-tensor-model-parallel-allreduce',
+                '--no-gradient-accumulation-fusion',
                 '--use-cpu-initialization',
                 '--micro-batch-size', '1',
                 '--no-load-optim',

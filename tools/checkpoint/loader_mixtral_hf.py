@@ -154,12 +154,16 @@ def _load_checkpoint(queue, args):
     # Llama-2 requires HF transformers >=4.31.0.
     verify_transformers_version()
 
-    # Search in directory above this.
-    sys.path.append(os.path.abspath(
-        os.path.join(os.path.dirname(__file__),
-                     os.path.pardir,
-                     os.path.pardir)))
+    # Prefer the current checkout over any unrelated installed Megatron package.
+    repo_root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir)
+    )
+    if repo_root in sys.path:
+        sys.path.remove(repo_root)
+    sys.path.insert(0, repo_root)
     if args.megatron_path is not None:
+        if args.megatron_path in sys.path:
+            sys.path.remove(args.megatron_path)
         sys.path.insert(0, args.megatron_path)
 
     try:
@@ -181,7 +185,7 @@ def _load_checkpoint(queue, args):
                 '--no-masked-softmax-fusion',
                 '--no-bias-gelu-fusion',
                 '--no-bias-dropout-fusion',
-                '--no-async-tensor-model-parallel-allreduce',
+                '--no-gradient-accumulation-fusion',
                 '--use-cpu-initialization',
                 '--micro-batch-size', '1',
                 '--no-load-optim',
