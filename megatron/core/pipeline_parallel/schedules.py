@@ -2447,8 +2447,11 @@ def forward_backward_pipelining_with_zero_bubble(
             # Only non-first stage can receive from previous stage.
             recv_prev = (not is_first_stage) and (forward_k < (total_num_microbatches - 1))
 
-            input_tensor = p2p_communicator.recv_forward(tensor_shape, is_first_stage)
-            input_tensors.append(input_tensor)
+            # The last pipeline stage does not call send_forward_recv_forward(), so it must
+            # explicitly recv the next forward activation each iteration.
+            if is_last_stage:
+                input_tensor = p2p_communicator.recv_forward(tensor_shape, False)
+                input_tensors.append(input_tensor)
 
             if max_outstanding_backprops is not None:
                 checkpoint_activations_microbatch = (
@@ -2515,8 +2518,10 @@ def forward_backward_pipelining_with_zero_bubble(
                 if config.grad_sync_func is None or rank == 0:
                     enable_grad_sync()
 
-            in_tensor = input_tensors.pop(0)
-            out_tensor = output_tensors.pop(0)
+            # For first PP stage we may not have stored per-microbatch input tensors
+            # (its input comes from data). Use None when the queue is empty.
+            in_tensor = input_tensors.pop(0) if input_tensors else None
+            out_tensor = output_tensors.pop(0) if output_tensors else None
 
             out_grad = p2p_communicator.recv_backward(
                 tensor_shape, is_pp_last_stage(pp_group)
