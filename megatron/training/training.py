@@ -87,6 +87,7 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
 )
 from megatron.core.utils import (
     check_param_hashes_across_dp_replicas,
+    configure_nvtx_profiling,
     get_attr_wrapped_model,
     get_model_config,
     get_pg_size,
@@ -2385,9 +2386,11 @@ def post_training_step_callbacks(
             if prof.execution_trace_observer is not None:
                 prof.execution_trace_observer.unregister_callback()
         else:
-            torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStop())
+            # Close NVTX while the capture is still active so ranges appear complete in the report.
+            configure_nvtx_profiling(False)
             if nsys_nvtx_context is not None:
                 nsys_nvtx_context.__exit__(None, None, None)
+            torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStop())
 
     # Manual garbage collection.
     if args.manual_gc:
@@ -2806,6 +2809,8 @@ def train(
                 torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStart())
                 nsys_nvtx_context = torch.autograd.profiler.emit_nvtx(record_shapes=True)
                 nsys_nvtx_context.__enter__()
+                # Megatron `nvtx_range_push` (e.g. zero-bubble MB_*_Bi/Bw) is gated on this flag.
+                configure_nvtx_profiling(True)
 
         ft_integration.on_checkpointing_start()
         maybe_finalize_async_save(blocking=False)

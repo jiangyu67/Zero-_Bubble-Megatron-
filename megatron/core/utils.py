@@ -2235,7 +2235,16 @@ def configure_nvtx_profiling(enabled: bool) -> None:
     Args:
         enabled (bool): Whether to enable NVTX range profiling
     """
-    global _nvtx_enabled
+    global _nvtx_enabled, _nvtx_range_messages
+    # Turning off after a partial iteration would leave `nvtx_range_push` ranges open
+    # (pops become no-ops once disabled). Flush Megatron-tracked CUDA NVTX ranges first.
+    if _nvtx_enabled and not enabled:
+        while _nvtx_range_messages:
+            _nvtx_range_messages.pop()
+            try:
+                torch.cuda.nvtx.range_pop()
+            except Exception:
+                break
     _nvtx_enabled = enabled
 
 
