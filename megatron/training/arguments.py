@@ -2555,7 +2555,10 @@ def _add_distributed_args(parser):
                        type=str, default='interleaving',
                        choices=['interleaving', 'no_interleaving', 'zero_bubble'],
                        help=('Pipeline schedule type. '
-                       'Options: interleaving (default), no_interleaving, zero_bubble'))
+                       'Options: interleaving (default), no_interleaving, zero_bubble. '
+                       'Note: zero_bubble with pipeline-model-parallel-size==2 defaults to '
+                       'no_interleaving (1F1B) unless MEGATRON_FORCE_ZERO_BUBBLE_PP2=1; use '
+                       'larger PP for practical zero-bubble overlap.'))
     group.add_argument('--pipeline-model-parallel-layout',
                        type=str, default=None,
                        help=('A string that describes a custom pipeline model parallel layout. '

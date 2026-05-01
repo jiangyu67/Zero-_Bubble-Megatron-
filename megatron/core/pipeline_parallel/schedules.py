@@ -2,6 +2,8 @@
 
 import collections
 import contextlib
+import os
+import warnings
 from functools import partial
 from typing import Callable, Iterator, List, Optional, Union
 
@@ -172,6 +174,32 @@ def get_forward_backward_func(
                 "pipeline schedule 'zero_bubble' is only implemented without virtual pipeline "
                 "(virtual_pipeline_model_parallel_size must be None)."
             )
+        # Bi/Bw split runs two autograd traversals per microbatch (input grads, then weights).
+        # With PP==2 there is essentially no pipeline bubble to hide Bw in, so this path is
+        # almost always slower than 1F1B while also stressing autograd/TE (retained graphs).
+        # Default to 1F1B unless explicitly forced for experiments.
+        _force_pp2_zb = os.environ.get("MEGATRON_FORCE_ZERO_BUBBLE_PP2", "").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        if pp_size == 2 and not _force_pp2_zb:
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                _warn = torch.distributed.get_rank() == 0
+            else:
+                _warn = True
+            if _warn:
+                warnings.warn(
+                    "pipeline schedule 'zero_bubble' with pipeline_model_parallel_size==2: "
+                    "using 1F1B (no_interleaving) by default because Bi/Bw split cannot overlap "
+                    "meaningful bubbles and tends to be much slower. "
+                    "Set MEGATRON_FORCE_ZERO_BUBBLE_PP2=1 to force the experimental zero-bubble "
+                    "implementation, or use larger PP (often PP>=4) where deferred Bw can overlap "
+                    "communication.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            return forward_backward_pipelining_without_interleaving
         return forward_backward_pipelining_with_zero_bubble
     if schedule_type == "no_interleaving":
         return forward_backward_pipelining_without_interleaving
@@ -484,9 +512,13 @@ def backward_step_full(
     if not isinstance(input_tensor, list):
         input_tensor = [input_tensor]
         unwrap_input_tensor_grad = True
-    for x in input_tensor:
-        if x is not None:
-            x.retain_grad()
+    # `retain_grad()` is only needed for the combined backward path that reads `x.grad` after
+    # `torch.autograd.backward`. The Bi split path returns grads via `torch.autograd.grad` and
+    # should not retain huge activation grads on non-leaf tensors (extra memory + graph churn).
+    if not (split_backward and backward_type == "input"):
+        for x in input_tensor:
+            if x is not None:
+                x.retain_grad()
 
     if not isinstance(output_tensor, list):
         output_tensor = [output_tensor]
@@ -2313,11 +2345,12 @@ def forward_backward_pipelining_with_zero_bubble(
                 pass
 
     def backward_weight_step_helper(microbatch_id, output_tensor, output_tensor_grad):
-        nvtx_range_push(f"MB_{microbatch_id}_Bw")
+        mb_range = f"MB_{microbatch_id}_Bw"
+        nvtx_range_push(mb_range)
         try:
             backward_weight_step(output_tensor, output_tensor_grad, config, model[0])
         finally:
-            nvtx_range_pop()
+            nvtx_range_pop(mb_range)
         if saved_deallocate_pipeline_outputs and output_tensor is not None:
             if isinstance(output_tensor, list) and output_tensor[0] is not None:
                 deallocate_output_tensor(output_tensor[0], True)
@@ -2347,7 +2380,8 @@ def forward_backward_pipelining_with_zero_bubble(
 
     def forward_step_helper(microbatch_id, checkpoint_activations_microbatch=None):
         nonlocal total_num_tokens
-        nvtx_range_push(f"MB_{microbatch_id}_F")
+        mb_range = f"MB_{microbatch_id}_F"
+        nvtx_range_push(mb_range)
         try:
             in_tensor = input_tensors[-1] if input_tensors else None
             output_tensor, num_tokens = forward_step(
@@ -2369,13 +2403,14 @@ def forward_backward_pipelining_with_zero_bubble(
                 is_last_stage=is_pp_last_stage(pp_group),
             )
         finally:
-            nvtx_range_pop()
+            nvtx_range_pop(mb_range)
         output_tensors.append(output_tensor)
         total_num_tokens += num_tokens
         return output_tensor
 
     def backward_input_step_helper(microbatch_id):
-        nvtx_range_push(f"MB_{microbatch_id}_Bi")
+        mb_range = f"MB_{microbatch_id}_Bi"
+        nvtx_range_push(mb_range)
         try:
             # Oldest outstanding microbatch.
             input_tensor = input_tensors.pop(0) if input_tensors else None
@@ -2385,7 +2420,7 @@ def forward_backward_pipelining_with_zero_bubble(
                 input_tensor, output_tensor, output_tensor_grad, model_type, config
             )
         finally:
-            nvtx_range_pop()
+            nvtx_range_pop(mb_range)
         return input_tensor_grad, output_tensor, output_tensor_grad
 
     try:

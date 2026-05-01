@@ -72,12 +72,30 @@ def test_get_forward_backward_func():
     Utils.destroy_model_parallel()
 
 
-def test_get_forward_backward_func_zero_bubble_pp_only():
+def test_get_forward_backward_func_zero_bubble_pp2_defaults_to_1f1b():
     Utils.initialize_model_parallel(tensor_model_parallel_size=2, pipeline_model_parallel_size=2)
-    assert (
-        schedule.get_forward_backward_func(schedule_type='zero_bubble')
-        == schedule.forward_backward_pipelining_with_zero_bubble
-    )
+    prev = os.environ.pop("MEGATRON_FORCE_ZERO_BUBBLE_PP2", None)
+    try:
+        assert (
+            schedule.get_forward_backward_func(schedule_type='zero_bubble')
+            == schedule.forward_backward_pipelining_without_interleaving
+        )
+    finally:
+        if prev is not None:
+            os.environ["MEGATRON_FORCE_ZERO_BUBBLE_PP2"] = prev
+    Utils.destroy_model_parallel()
+
+
+def test_get_forward_backward_func_zero_bubble_pp2_forced():
+    Utils.initialize_model_parallel(tensor_model_parallel_size=2, pipeline_model_parallel_size=2)
+    os.environ["MEGATRON_FORCE_ZERO_BUBBLE_PP2"] = "1"
+    try:
+        assert (
+            schedule.get_forward_backward_func(schedule_type='zero_bubble')
+            == schedule.forward_backward_pipelining_with_zero_bubble
+        )
+    finally:
+        os.environ.pop("MEGATRON_FORCE_ZERO_BUBBLE_PP2", None)
     Utils.destroy_model_parallel()
 
 
