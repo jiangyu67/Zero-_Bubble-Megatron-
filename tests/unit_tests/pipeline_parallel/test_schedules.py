@@ -110,6 +110,33 @@ def test_get_forward_backward_func_zero_bubble_rejects_vpp():
     Utils.destroy_model_parallel()
 
 
+def test_get_forward_backward_func_dual_pipe_routes():
+    Utils.initialize_model_parallel(tensor_model_parallel_size=2, pipeline_model_parallel_size=4)
+    assert (
+        schedule.get_forward_backward_func(schedule_type='dual_pipe')
+        == schedule.forward_backward_pipelining_with_dual_pipe
+    )
+    Utils.destroy_model_parallel()
+
+
+def test_get_forward_backward_func_dual_pipe_rejects_pp1():
+    Utils.initialize_model_parallel(tensor_model_parallel_size=2, pipeline_model_parallel_size=1)
+    with pytest.raises(ValueError):
+        schedule.get_forward_backward_func(schedule_type='dual_pipe')
+    Utils.destroy_model_parallel()
+
+
+def test_get_forward_backward_func_dual_pipe_rejects_vpp():
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=2,
+        pipeline_model_parallel_size=4,
+        virtual_pipeline_model_parallel_size=2,
+    )
+    with pytest.raises(ValueError):
+        schedule.get_forward_backward_func(schedule_type='dual_pipe')
+    Utils.destroy_model_parallel()
+
+
 def test_deallocate_output_tensor():
     out = torch.tensor([[1, 2, 3], [4, 5, 6]])
     schedule.deallocate_output_tensor(out)

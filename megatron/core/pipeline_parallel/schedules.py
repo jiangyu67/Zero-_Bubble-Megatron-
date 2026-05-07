@@ -145,7 +145,8 @@ def get_forward_backward_func(
             Otherwise, provided values are used as-is and None is treated as an explicit input.
         schedule_type (Optional[str]): When set, selects the pipeline schedule explicitly.
             Use None to preserve legacy behavior (only pp_size / vp_size). Typical values come from
-            ``args.pipeline_schedule``: ``'interleaving'``, ``'no_interleaving'``, ``'zero_bubble'``.
+            ``args.pipeline_schedule``: ``'interleaving'``, ``'no_interleaving'``, ``'zero_bubble'``,
+            ``'dual_pipe'``.
 
     """
     if pp_size is None and vp_size is None:
@@ -166,6 +167,8 @@ def get_forward_backward_func(
     if pp_size <= 1:
         if schedule_type == "zero_bubble":
             raise ValueError("pipeline schedule 'zero_bubble' requires pipeline_model_parallel_size > 1.")
+        if schedule_type == "dual_pipe":
+            raise ValueError("pipeline schedule 'dual_pipe' requires pipeline_model_parallel_size > 1.")
         return forward_backward_no_pipelining
 
     if schedule_type == "zero_bubble":
@@ -201,6 +204,17 @@ def get_forward_backward_func(
                 )
             return forward_backward_pipelining_without_interleaving
         return forward_backward_pipelining_with_zero_bubble
+    if schedule_type == "dual_pipe":
+        if vp_size is not None:
+            raise ValueError(
+                "pipeline schedule 'dual_pipe' is only implemented without virtual pipeline "
+                "(virtual_pipeline_model_parallel_size must be None)."
+            )
+        if pp_size <= 1:
+            raise ValueError(
+                "pipeline schedule 'dual_pipe' requires pipeline_model_parallel_size > 1."
+            )
+        return forward_backward_pipelining_with_dual_pipe
     if schedule_type == "no_interleaving":
         return forward_backward_pipelining_without_interleaving
     if schedule_type == "interleaving":
@@ -2630,6 +2644,18 @@ def get_tensor_shapes(
     return tensor_shapes
 
 
+def _dual_pipe_forward_model_for_microbatch(
+    model_primary: torch.nn.Module, microbatch_id: int
+) -> torch.nn.Module:
+    """Even global microbatch id -> primary (DDP) chunk; odd id -> sibling weight replica."""
+    from megatron.training.dual_pipe_utils import get_dual_pipe_bwd_module
+
+    bwd = get_dual_pipe_bwd_module(model_primary)
+    if bwd is None:
+        return model_primary
+    return model_primary if (microbatch_id % 2 == 0) else bwd
+
+
 def forward_backward_pipelining_without_interleaving(
     *,
     forward_step_func,
@@ -2646,6 +2672,8 @@ def forward_backward_pipelining_without_interleaving(
     p2p_communicator: Optional[P2PCommunicator] = None,
     pg_collection: Optional[ProcessGroupCollection] = None,
     force_all_reduce: Optional[bool] = False,
+    forward_model_for_microbatch: Optional[Callable[[int], torch.nn.Module]] = None,
+    post_backward_pre_finalize: Optional[Callable[[], None]] = None,
 ):
     """Run non-interleaved 1F1B schedule, with communication between pipeline
     stages. Returns dictionary with losses if the last stage, empty dict otherwise."""
@@ -2817,10 +2845,13 @@ def forward_backward_pipelining_without_interleaving(
         input_tensor = p2p_communicator.recv_forward(
             recv_tensor_shapes, is_pp_first_stage(p2p_communicator.pp_group)
         )
+        forward_model = (
+            model if forward_model_for_microbatch is None else forward_model_for_microbatch(i)
+        )
         output_tensor, num_tokens = forward_step(
             forward_step_func,
             data_iterator,
-            model,
+            forward_model,
             num_microbatches,
             input_tensor,
             forward_data_store,
@@ -2860,10 +2891,14 @@ def forward_backward_pipelining_without_interleaving(
         else:
             checkpoint_activations_microbatch = None
 
+        _mb_id = i + num_warmup_microbatches
+        forward_model = (
+            model if forward_model_for_microbatch is None else forward_model_for_microbatch(_mb_id)
+        )
         output_tensor, num_tokens = forward_step(
             forward_step_func,
             data_iterator,
-            model,
+            forward_model,
             num_microbatches,
             input_tensor,
             forward_data_store,
@@ -2874,7 +2909,7 @@ def forward_backward_pipelining_without_interleaving(
             is_first_microbatch=check_first_val_step(
                 first_val_step, forward_only, (i == 0) and (num_warmup_microbatches == 0)
             ),
-            current_microbatch=i + num_warmup_microbatches,
+            current_microbatch=_mb_id,
             is_last_stage=is_pp_last_stage(p2p_communicator.pp_group),
         )
         total_num_tokens += num_tokens
@@ -2958,6 +2993,9 @@ def forward_backward_pipelining_without_interleaving(
             if config.grad_sync_func is not None:
                 config.grad_sync_func(model.parameters())
 
+    if post_backward_pre_finalize is not None and not forward_only:
+        post_backward_pre_finalize()
+
     if config.finalize_model_grads_func is not None and not forward_only:
 
         # If defer_embedding_wgrad_compute is enabled we need to do the
@@ -2990,3 +3028,67 @@ def forward_backward_pipelining_without_interleaving(
         create_cudagraphs()
 
     return forward_data_store
+
+
+def forward_backward_pipelining_with_dual_pipe(
+    *,
+    forward_step_func,
+    data_iterator: Union[Iterator, List[Iterator]],
+    model: Union[torch.nn.Module, List[torch.nn.Module]],
+    num_microbatches: int,
+    seq_length: int,
+    micro_batch_size: int,
+    decoder_seq_length: Optional[int] = None,
+    forward_only: bool = False,
+    collect_non_loss_data: bool = False,
+    first_val_step: Optional[bool] = None,
+    adjust_tensor_shapes_fn: Optional[Callable] = None,
+    p2p_communicator: Optional[P2PCommunicator] = None,
+    pg_collection: Optional[ProcessGroupCollection] = None,
+    force_all_reduce: Optional[bool] = False,
+):
+    """Dense DualPipe: 1F1B P2P pattern with per-microbatch replica selection + grad merge.
+
+    Uses the same warmup / steady / cooldown communication as ``no_interleaving``, but routes
+    each forward pass through either the primary (DDP) chunk or the attached sibling replica
+    (even/odd global microbatch index). Gradients on the replica are merged into the primary's
+    ``main_grad`` before ``finalize_model_grads`` (see ``merge_dual_pipe_bwd_grads_into_fwd``).
+    """
+    if isinstance(model, list):
+        assert len(model) == 1, "dual_pipe expects a single pipeline chunk (no VPP)"
+        fwd_chunk = model[0]
+    else:
+        fwd_chunk = model
+
+    cfg = get_model_config(fwd_chunk)
+    if cfg.defer_embedding_wgrad_compute:
+        raise ValueError(
+            "pipeline schedule dual_pipe does not support defer_embedding_wgrad_compute; "
+            "set defer_embedding_wgrad_compute=False or use no_interleaving."
+        )
+
+    from megatron.training.dual_pipe_utils import merge_dual_pipe_bwd_grads_into_fwd
+
+    def _mb_model(mid: int) -> torch.nn.Module:
+        return _dual_pipe_forward_model_for_microbatch(fwd_chunk, mid)
+
+    model_arg = model if isinstance(model, list) else [fwd_chunk]
+
+    return forward_backward_pipelining_without_interleaving(
+        forward_step_func=forward_step_func,
+        data_iterator=data_iterator,
+        model=model_arg,
+        num_microbatches=num_microbatches,
+        seq_length=seq_length,
+        micro_batch_size=micro_batch_size,
+        decoder_seq_length=decoder_seq_length,
+        forward_only=forward_only,
+        collect_non_loss_data=collect_non_loss_data,
+        first_val_step=first_val_step,
+        adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
+        p2p_communicator=p2p_communicator,
+        pg_collection=pg_collection,
+        force_all_reduce=force_all_reduce,
+        forward_model_for_microbatch=_mb_model,
+        post_backward_pre_finalize=lambda: merge_dual_pipe_bwd_grads_into_fwd(fwd_chunk),
+    )

@@ -1209,6 +1209,44 @@ def update_train_iters(args):
     print_rank_0(f'setting training iterations to {args.train_iters}')
 
 
+def _attach_dual_pipe_bwd_weight_replica(
+    model,
+    model_provider_func,
+    model_type,
+    config,
+    pg_collection,
+):
+    """Build a non-DDP Float16 sibling of the primary PP chunk; weights match the trained copy."""
+    args = get_args()
+    if getattr(args, "pipeline_schedule", None) != "dual_pipe":
+        return
+    if get_pg_size(pg_collection.pp) <= 1:
+        return
+    if args.virtual_pipeline_model_parallel_size is not None:
+        return
+    assert len(model) == 1, "dual_pipe expects a single pipeline chunk (no VPP)"
+    from megatron.training.dual_pipe_utils import MEGATRON_DUAL_PIPE_BWD_ATTR
+
+    bwd_core = model_provider_func(
+        pre_process=is_pp_first_stage(pg_collection.pp),
+        post_process=is_pp_last_stage(pg_collection.pp),
+        config=config,
+        pg_collection=pg_collection,
+    )
+    bwd_core.model_type = model_type
+    bwd_core.cuda(torch.cuda.current_device())
+    mcfg = get_model_config(model[0])
+    bwd_fp16 = Float16Module(mcfg, bwd_core)
+    correct_amax_history_if_needed([bwd_fp16])
+    with torch.no_grad():
+        for p_src, p_dst in zip(
+            unwrap_model(model[0]).parameters(),
+            unwrap_model(bwd_fp16).parameters(),
+        ):
+            p_dst.data.copy_(p_src.data)
+    setattr(model[0], MEGATRON_DUAL_PIPE_BWD_ATTR, bwd_fp16)
+
+
 def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True, config=None, pg_collection=None):
     """Build the model."""
     args = get_args()
@@ -1407,6 +1445,15 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         if args.data_parallel_random_init:
             for model_module in model:
                 model_module.broadcast_params()
+
+        if getattr(args, "pipeline_schedule", None) == "dual_pipe":
+            _attach_dual_pipe_bwd_weight_replica(
+                model,
+                model_provider_func,
+                model_type,
+                config,
+                pg_collection,
+            )
 
     return model
 
@@ -1622,6 +1669,9 @@ def setup_model_and_optimizer(
             and getattr(args, "use_torch_fsdp2", False)
             and args.ckpt_format == "torch_dist",
         )
+        from megatron.training.dual_pipe_utils import dual_pipe_sync_bwd_weights_from_fwd
+
+        dual_pipe_sync_bwd_weights_from_fwd(model)
         timers('load-checkpoint').stop(barrier=True)
         timers.log(['load-checkpoint'])
         one_logger and one_logger.log_metrics(
@@ -1683,6 +1733,10 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     """Single training step."""
     args = get_args()
     timers = get_timers()
+    from megatron.training.dual_pipe_utils import (
+        dual_pipe_sync_bwd_weights_from_fwd,
+        dual_pipe_zero_grad_extra,
+    )
 
     rerun_state_machine = get_rerun_state_machine()
     save_dgrads_in_this_iteration = (args.save_dgrads_interval is not None and
@@ -1696,6 +1750,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             # If saving main_grads in this iteration, then all-reduce instead of reduce-scatter.
             model_chunk.force_all_reduce = save_wgrads_in_this_iteration
         optimizer.zero_grad()
+
+        dual_pipe_zero_grad_extra(model)
 
         if has_nvidia_modelopt:
             # [ModelOpt]: Pipeline-parallel Distillation stacks student and teacher tensors
@@ -1780,6 +1836,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+
+    dual_pipe_sync_bwd_weights_from_fwd(model)
 
     # get max attention logit for logging and run clip_qk()
     # Part of MuonClip Optimizer step

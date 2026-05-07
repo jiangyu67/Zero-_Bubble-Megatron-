@@ -820,6 +820,39 @@ def validate_args(args, defaults={}):
             '--num-virtual-stages-per-pipeline-rank when using zero_bubble).'
         )
 
+    if getattr(args, 'pipeline_schedule', None) == 'dual_pipe':
+        assert args.pipeline_model_parallel_size > 1, (
+            '--pipeline-schedule dual_pipe requires pipeline-model-parallel-size > 1'
+        )
+        assert args.virtual_pipeline_model_parallel_size is None, (
+            '--pipeline-schedule dual_pipe is only supported without virtual pipeline '
+            '(do not set --num-layers-per-virtual-pipeline-stage / '
+            '--num-virtual-stages-per-pipeline-rank when using dual_pipe).'
+        )
+        assert not args.use_torch_fsdp2, (
+            '--pipeline-schedule dual_pipe is not supported with --use-torch-fsdp2'
+        )
+        assert not args.use_megatron_fsdp, (
+            '--pipeline-schedule dual_pipe is not supported with --use-megatron-fsdp'
+        )
+        assert not args.init_model_with_meta_device, (
+            '--pipeline-schedule dual_pipe is not supported with --init-model-with-meta-device'
+        )
+        if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
+            raise ValueError(
+                '--pipeline-schedule dual_pipe is not supported with full-iteration local CUDA graphs'
+            )
+        if getattr(args, 'fp8', None) is not None or getattr(args, 'fp4', None) is not None:
+            warn_rank_0(
+                '--pipeline-schedule dual_pipe with FP8/FP4 is experimental; expect higher memory '
+                'use from the secondary weight replica and validate numerics.',
+                args.rank,
+            )
+        assert not args.overlap_grad_reduce, (
+            '--pipeline-schedule dual_pipe does not support --overlap-grad-reduce yet '
+            '(replica grads are merged once per iteration; overlapping DDP grad hooks are not wired).'
+        )
+
     if args.overlap_param_gather:
         assert args.use_distributed_optimizer or args.use_megatron_fsdp \
             or args.optimizer == 'dist_muon', \
@@ -2553,12 +2586,15 @@ def _add_distributed_args(parser):
                        'Default None is even split of transformer layers across all pipeline stages'))
     group.add_argument('--pipeline-schedule',
                        type=str, default='interleaving',
-                       choices=['interleaving', 'no_interleaving', 'zero_bubble'],
+                       choices=['interleaving', 'no_interleaving', 'zero_bubble', 'dual_pipe'],
                        help=('Pipeline schedule type. '
-                       'Options: interleaving (default), no_interleaving, zero_bubble. '
+                       'Options: interleaving (default), no_interleaving, zero_bubble, dual_pipe. '
                        'Note: zero_bubble with pipeline-model-parallel-size==2 defaults to '
                        'no_interleaving (1F1B) unless MEGATRON_FORCE_ZERO_BUBBLE_PP2=1; use '
-                       'larger PP for practical zero-bubble overlap.'))
+                       'larger PP for practical zero-bubble overlap. '
+                       'dual_pipe (dense) builds a secondary weight replica per PP rank and '
+                       'stripes forwards across even/odd microbatches; requires overlap-grad-reduce '
+                       'to be disabled.'))
     group.add_argument('--pipeline-model-parallel-layout',
                        type=str, default=None,
                        help=('A string that describes a custom pipeline model parallel layout. '
